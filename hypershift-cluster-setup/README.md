@@ -68,6 +68,15 @@ Binaries:
 
 ## Known issues
 
+### MCO CRDs present but non-functional
+Azure HCP hosted clusters have MachineConfig CRDs registered in the API, but the MCO operator is not functional:
+- `kubectl get machineconfigpools` returns "server doesn't have a resource type"
+- `kubectl get machineconfigs` returns "server doesn't have a resource type"  
+- No machine-config-daemon DaemonSet running on workers
+- No MCO controller pods managing the cluster
+
+**Impact:** OSC DaemonSet mode is **required** (MachineConfig mode will not work). The validation step checks for functional MCO by testing MachineConfigPool availability, not just CRD presence.
+
 ### Federated credential audience must be "openshift"
 OpenShift service account tokens use `"openshift"` audience, not the Azure standard `"api://AzureADTokenExchange"`. The setup step creates federated credentials with the correct audience.
 

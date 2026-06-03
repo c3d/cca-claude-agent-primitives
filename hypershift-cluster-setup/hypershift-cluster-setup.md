@@ -358,16 +358,38 @@ NODE_COUNT_ACTUAL=$(KUBECONFIG=${HOSTED_KUBECONFIG} oc get nodes --no-headers 2>
 echo ""
 echo "Worker nodes: ${NODE_COUNT_ACTUAL}/${NODE_COUNT}"
 
-# Verify MCO/MachineConfig CRDs are absent (required for OSC DaemonSet mode)
+# Verify MCO is not functional (required for OSC DaemonSet mode)
 echo ""
-echo "=== MCO/MachineConfig Check (must be absent for DaemonSet mode) ==="
-KUBECONFIG=${HOSTED_KUBECONFIG} kubectl get crd | grep -i machineconfig && {
-    echo "ERROR: MachineConfig CRDs found! HCP workers should not have MCO."
-    echo "This cluster cannot use DaemonSet mode properly."
+echo "=== MCO/MachineConfig Check ==="
+echo "Checking if MCO is functional (it should NOT be on Azure HCP)..."
+
+# Check for MachineConfigPools (the key indicator of functional MCO)
+KUBECONFIG=${HOSTED_KUBECONFIG} kubectl get machineconfigpools 2>&1 | grep -q "error: the server doesn't have a resource type" && {
+    echo "✓ MachineConfigPools not available (MCO not functional)"
+    MCO_FUNCTIONAL=false
+} || {
+    MCP_COUNT=$(KUBECONFIG=${HOSTED_KUBECONFIG} kubectl get machineconfigpools --no-headers 2>/dev/null | wc -l)
+    if [[ "$MCP_COUNT" -gt 0 ]]; then
+        echo "ERROR: Found $MCP_COUNT MachineConfigPools - MCO is functional!"
+        echo "This cluster has a working MCO and should use MachineConfig mode, not DaemonSet."
+        exit 1
+    else
+        echo "✓ No MachineConfigPools (MCO not functional)"
+        MCO_FUNCTIONAL=false
+    fi
+}
+
+# Verify machine-config-daemon is not running
+KUBECONFIG=${HOSTED_KUBECONFIG} kubectl get daemonset -A 2>/dev/null | grep -q machine-config-daemon && {
+    echo "ERROR: machine-config-daemon is running - MCO is functional!"
     exit 1
 } || {
-    echo "✓ No MachineConfig CRDs (correct for HCP workers)"
+    echo "✓ No machine-config-daemon DaemonSet"
 }
+
+echo ""
+echo "✓ MCO is not functional on this cluster (correct for Azure HCP)"
+echo "  OSC DaemonSet mode is required and will work correctly"
 
 # Check cluster version
 echo ""
