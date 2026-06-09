@@ -20,7 +20,7 @@ Skills extend Claude Code via the Skill tool and are installed in `~/.claude/ski
 
 | Skill | Description |
 |---|---|
-| *(more coming soon)* | |
+| [hypershift-cluster-setup](./hypershift-cluster-setup/) | Complete Azure HyperShift setup — creates management cluster (IPI OpenShift), installs MCE/HyperShift, creates hosted clusters with OIDC/managed identities, validates OSC DaemonSet readiness |
 
 ## Installation
 
