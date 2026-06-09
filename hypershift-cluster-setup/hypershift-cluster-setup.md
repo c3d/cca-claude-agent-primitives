@@ -65,7 +65,7 @@ Working Directory:
 Parse `$ARGUMENTS`:
 - First positional arg: scope (`management` or `hosted`)
 - Second positional arg: action
-  - For `management`: `create`, `install-mce`, `teardown`
+  - For `management`: `create`, `setup`, `teardown`
   - For `hosted`: `setup`, `validate`, `teardown`
 
 **Flags:**
@@ -81,7 +81,7 @@ Which operation do you want to run?
 
 Management Cluster:
   1) management create      — Create IPI OpenShift cluster on Azure
-  2) management install-mce — Install MCE + HyperShift on management cluster
+  2) management setup — Install MCE + HyperShift on management cluster
   3) management teardown    — Delete management cluster
 
 Hosted Cluster:
@@ -213,7 +213,7 @@ echo "  Kubeconfig: ~/Work/azure-hcp/auth/kubeconfig"
 echo "  Console: https://console-openshift-console.apps.${MGMT_NAME}.${BASE_DOMAIN}"
 echo ""
 echo "Next steps:"
-echo "  1. Install MCE: /hypershift-cluster-setup management install-mce"
+echo "  1. Setup management: /hypershift-cluster-setup management setup"
 echo "  2. Create hosted cluster: /hypershift-cluster-setup hosted setup"
 ```
 
@@ -503,7 +503,7 @@ oc cluster-info >/dev/null 2>&1 || { echo "BLOCK: Management cluster not accessi
 # Check MCE/HyperShift
 oc get crd hostedclusters.hypershift.openshift.io >/dev/null 2>&1 || {
     echo "BLOCK: HyperShift CRDs not found. Install MCE first:"
-    echo "  /hypershift-cluster-setup management install-mce"
+    echo "  /hypershift-cluster-setup management setup"
     exit 1
 }
 
