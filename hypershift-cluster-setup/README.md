@@ -31,8 +31,8 @@ Run with no arguments for an interactive prompt.
 
 | Flag | Applies to | Effect |
 |---|---|---|
-| `--name <name>` | `management create`, `management teardown` | Management cluster name (default: `c3d-ocp421`) |
-| `--cluster-name <name>` | `hosted setup`, `hosted teardown`, `hosted validate` | Hosted cluster name (default: `c3d-hcp-<timestamp>`) |
+| `--name <name>` | `management create`, `management teardown` | Management cluster name (default: `$USER-hcp-host-$VERSION` extracted from release image) |
+| `--cluster-name <name>` | `hosted setup`, `hosted teardown`, `hosted validate` | Hosted cluster name (default: `$USER-hcp-YYYYMMDD`) |
 | `--location <region>` | `management create`, `hosted setup` | Azure region (default: `eastus`) |
 | `--node-count <n>` | `hosted setup` | Number of worker nodes for hosted cluster (default: `2`) |
 | `--release-image <image>` | `hosted setup` | OCP release image (default: `quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64`) |

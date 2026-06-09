@@ -69,13 +69,15 @@ Parse `$ARGUMENTS`:
   - For `hosted`: `setup`, `validate`, `teardown`
 
 **Flags:**
-- `--name <name>` — management cluster name (default: `c3d-ocp421`)
-- `--cluster-name <name>` — hosted cluster name (default: `c3d-hcp-$(date +%s)`)
+- `--name <name>` — management cluster name (default: `$USER-hcp-host-$VERSION` where VERSION extracted from OCP release)
+- `--cluster-name <name>` — hosted cluster name (default: `$USER-hcp-$(date +%Y%m%d)`)
 - `--location <region>` — Azure region (default: `eastus`)
 - `--node-count <n>` — worker nodes for hosted cluster (default: `2`)
 - `--release-image <image>` — OCP release (default: `quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64`)
 
-If no arguments given, ask:
+If no arguments given, show menu and ask for operation. THEN after selection, ask for parameters specific to that operation before executing.
+
+Menu to show:
 ```
 Which operation do you want to run?
 
@@ -90,14 +92,50 @@ Hosted Cluster:
   6) hosted teardown        — Delete hosted cluster and Azure resources
 ```
 
-Set defaults:
+After user selects operation, prompt for required parameters:
+
+**For management create:**
+First extract VERSION from release image:
 ```bash
+RELEASE_IMAGE="${RELEASE_IMAGE:-quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64}"
+VERSION=$(echo "$RELEASE_IMAGE" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+DEFAULT_MGMT_NAME="${USER}-hcp-host-${VERSION}"
+```
+Then prompt:
+```
+Management cluster name [${DEFAULT_MGMT_NAME}]: 
+Azure region [eastus]: 
+```
+
+**For management setup/teardown:**
+```
+Management cluster name: (required - list existing via 'ls ~/Work/azure-hcp/' or check current KUBECONFIG)
+```
+
+**For hosted setup:**
+```
+Hosted cluster name [${USER}-hcp-$(date +%Y%m%d)]: 
+Azure region [eastus]: 
+Number of worker nodes [2]: 
+```
+
+**For hosted validate/teardown:**
+```
+Hosted cluster name: (required, no default - list existing if possible)
+```
+
+Set defaults based on user input or defaults:
+```bash
+# Extract OCP version from release image
+RELEASE_IMAGE="${RELEASE_IMAGE:-quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64}"
+VERSION=$(echo "$RELEASE_IMAGE" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+
 # Management cluster
-MGMT_NAME="${MGMT_NAME:-c3d-ocp421}"
+MGMT_NAME="${MGMT_NAME:-${USER}-hcp-host-${VERSION}}"
 MGMT_KUBECONFIG="${MGMT_KUBECONFIG:-$HOME/Work/azure-hcp/auth/kubeconfig}"
 
 # Hosted cluster
-CLUSTER_NAME="${CLUSTER_NAME:-c3d-hcp-$(date +%s)}"
+CLUSTER_NAME="${CLUSTER_NAME:-${USER}-hcp-$(date +%Y%m%d)}"
 LOCATION="${LOCATION:-eastus}"
 NODE_COUNT="${NODE_COUNT:-2}"
 RELEASE_IMAGE="${RELEASE_IMAGE:-quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64}"
