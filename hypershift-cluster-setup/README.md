@@ -1,41 +1,58 @@
 # hypershift-cluster-setup command
 
-Manages the full lifecycle of a self-managed Azure HyperShift hosted cluster: Azure workload identity setup, hosted cluster creation, worker node provisioning, and validation. Designed for testing OpenShift Sandboxed Containers (OSC) DaemonSet mode on HCP clusters.
+Complete Azure HyperShift setup from management cluster creation to hosted cluster validation. Automates IPI OpenShift installation, MCE/HyperShift deployment, Azure workload identity configuration, and hosted cluster provisioning. Designed for testing OpenShift Sandboxed Containers (OSC) DaemonSet mode on Azure HCP.
 
 ## Invocation
 
 ```
-/hypershift-cluster-setup [setup [--cluster-name <NAME>] [--location <REGION>] [--node-count <N>] | validate | teardown [--cluster-name <NAME>]]
+/hypershift-cluster-setup management <create|setup|teardown> [--name <NAME>]
+/hypershift-cluster-setup hosted <setup|validate|teardown> [--cluster-name <NAME>] [--location <REGION>] [--node-count <N>]
 ```
 
 Run with no arguments for an interactive prompt.
 
-## Subcommands
+## Management Cluster Operations
 
-| Subcommand | What it does |
+| Command | What it does |
 |---|---|
-| `setup` | Creates Azure OIDC issuer, managed identities, and hosted cluster with worker nodes |
-| `validate` | Verifies worker nodes joined, checks MCO/MachineConfig CRDs are absent, tests cluster readiness for OSC DaemonSet |
-| `teardown` | Deletes hosted cluster resources, Azure VMs, managed identities, and OIDC infrastructure |
+| `management create` | Creates IPI OpenShift 4.21+ cluster on Azure using openshift-install (3 control plane + 3 worker nodes) |
+| `management setup` | Installs MCE 2.11+ and HyperShift operator, configures Azure prerequisites (EncryptionAtHost), verifies binaries (ccoctl, hypershift CLI) |
+| `management teardown` | Destroys management cluster and all Azure resources using openshift-install |
+
+## Hosted Cluster Operations
+
+| Command | What it does |
+|---|---|
+| `hosted setup` | Creates Azure OIDC issuer, managed identities with federated credentials, and hosted cluster with worker nodes |
+| `hosted validate` | Verifies worker nodes joined, checks MCO is non-functional (required for DaemonSet mode), tests cluster readiness |
+| `hosted teardown` | Deletes hosted cluster resources, Azure VMs, managed identities, and OIDC infrastructure |
 
 ## Flags
 
 | Flag | Applies to | Effect |
 |---|---|---|
-| `--cluster-name <name>` | `setup`, `teardown`, `validate` | Hosted cluster name (default: `hcp-<timestamp>`) |
-| `--location <region>` | `setup` | Azure region (default: `eastus`) |
-| `--node-count <n>` | `setup` | Number of worker nodes (default: `2`) |
-| `--release-image <image>` | `setup` | OCP release image (default: `quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64`) |
+| `--name <name>` | `management create`, `management teardown` | Management cluster name (default: `c3d-ocp421`) |
+| `--cluster-name <name>` | `hosted setup`, `hosted teardown`, `hosted validate` | Hosted cluster name (default: `c3d-hcp-<timestamp>`) |
+| `--location <region>` | `management create`, `hosted setup` | Azure region (default: `eastus`) |
+| `--node-count <n>` | `hosted setup` | Number of worker nodes for hosted cluster (default: `2`) |
+| `--release-image <image>` | `hosted setup` | OCP release image (default: `quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64`) |
 
 ## Prerequisites
 
-- Management cluster with MCE + HyperShift installed (OCP 4.21+)
-- Azure credentials configured (`az login`)
-- `ccoctl-native` (ARM64 macOS) or `ccoctl` (Linux amd64)
-- `hypershift` CLI (ARM64 macOS) or from MCE operator image
-- `oc`, `kubectl`, `az`, `jq` installed
-- Azure DNS zone for base domain
-- Pull secret from Red Hat
+### For Management Cluster Creation
+- Azure subscription with sufficient quotas (compute, networking, storage)
+- Azure DNS zone for base domain (e.g., `azure.sandboxedcontainers.com` in resource group `osc-clusters`)
+- `openshift-install` binary from [mirror.openshift.com](https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-4.21/)
+- `az` CLI with active login (`az login`)
+- `oc`, `kubectl`, `jq` installed
+- Pull secret from [Red Hat](https://console.redhat.com/openshift/install/pull-secret)
+- SSH public key (~/.ssh/id_rsa.pub)
+
+### For Hosted Cluster Creation  
+- Running management cluster with MCE + HyperShift (created via `management create` + `management install-mce`)
+- `ccoctl-native` (ARM64 macOS) or `ccoctl` (Linux amd64) - built from source or downloaded
+- `hypershift` CLI (ARM64 macOS) - built from source
+- EncryptionAtHost feature enabled on Azure subscription
 
 ## Expected environment
 
@@ -103,8 +120,43 @@ This usually indicates worker nodes haven't joined. Check:
 - cloud-token-minter logs show successful token creation
 - No authentication errors in capi-provider logs
 
+## Complete Workflow Example
+
+### From Zero to Hosted Cluster
+
+```bash
+# 1. Create management cluster (IPI OpenShift on Azure)
+/hypershift-cluster-setup management create --name my-mgmt --location eastus
+# Takes ~40 minutes
+
+# 2. Setup management cluster (MCE + HyperShift + prerequisites)
+/hypershift-cluster-setup management setup
+# Takes ~5-10 minutes
+
+# 3. Create hosted cluster
+/hypershift-cluster-setup hosted setup --cluster-name my-hcp --node-count 2
+# Takes ~15-20 minutes (control plane) + ~10 minutes (workers)
+
+# 4. Validate hosted cluster
+/hypershift-cluster-setup hosted validate --cluster-name my-hcp
+
+# 5. Use the hosted cluster
+export KUBECONFIG=~/Work/azure-hcp/my-hcp-kubeconfig
+oc get nodes
+```
+
+### Cleanup
+
+```bash
+# Delete hosted cluster (keeps management cluster)
+/hypershift-cluster-setup hosted teardown --cluster-name my-hcp
+
+# Delete management cluster (destroys everything)
+/hypershift-cluster-setup management teardown --name my-mgmt
+```
+
 ## Install
 
 ```bash
-cp hypershift-cluster-setup/hypershift-cluster-setup.md ~/.claude/commands/hypershift-cluster-setup.md
+ln -s ~/Work/claude-agent-primitives/hypershift-cluster-setup/hypershift-cluster-setup.md ~/.claude/commands/hypershift-cluster-setup.md
 ```
