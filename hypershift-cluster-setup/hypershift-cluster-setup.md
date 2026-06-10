@@ -1,7 +1,7 @@
 ---
 name: hypershift-cluster-setup
-description: Complete Azure HyperShift setup — creates management cluster (IPI OpenShift), installs MCE/HyperShift, creates hosted clusters with OIDC/managed identities, validates OSC DaemonSet readiness. Supports full teardown. Azure credentials must be configured via az login.
-argument-hint: "management create|setup|teardown [--name <NAME>] | hosted setup|validate|teardown [--cluster-name <NAME>] [--location <REGION>] [--node-count <N>]"
+description: Complete Azure HyperShift setup — creates management cluster (IPI OpenShift), installs MCE/HyperShift, creates hosted clusters with OIDC/managed identities, installs and validates OSC DaemonSet. Supports full teardown. Azure credentials must be configured via az login.
+argument-hint: "management create|setup|teardown [--name <NAME>] | hosted setup|validate|teardown [--cluster-name <NAME>] [--location <REGION>] [--node-count <N>] | osc install|validate|reboot [--cluster-name <NAME>]"
 allowed-tools:
   - Read
   - Write
@@ -24,6 +24,11 @@ Automate the complete lifecycle of self-managed Azure HyperShift for testing Ope
 - **hosted setup** — create Azure OIDC issuer, managed identities with workload identity federation, and hosted cluster with worker nodes
 - **hosted validate** — verify workers joined, confirm MCO non-functional (required for DaemonSet mode), test cluster readiness
 - **hosted teardown** — delete hosted cluster, Azure VMs, managed identities, and OIDC infrastructure
+
+**OSC Operations:**
+- **osc install** — install OSC operator, configure DaemonSet mode, create KataConfig, label worker nodes
+- **osc validate** — verify kata runtime installed on nodes, test kata pod deployment
+- **osc reboot** — cordon, drain, and reboot worker nodes (required after kata installation)
 
 Azure credentials are assumed to be configured via `az login`.
 
@@ -63,10 +68,11 @@ Working Directory:
 ## 0. Parse Arguments
 
 Parse `$ARGUMENTS`:
-- First positional arg: scope (`management` or `hosted`)
+- First positional arg: scope (`management`, `hosted`, or `osc`)
 - Second positional arg: action
   - For `management`: `create`, `setup`, `teardown`
   - For `hosted`: `setup`, `validate`, `teardown`
+  - For `osc`: `install`, `validate`, `reboot`
 
 **Flags:**
 - `--name <name>` — management cluster name (default: `$USER-hcp-host-$VERSION` where VERSION extracted from OCP release)
@@ -90,6 +96,11 @@ Hosted Cluster:
   4) hosted setup           — Create OIDC, identities, and hosted cluster
   5) hosted validate        — Check worker nodes and cluster readiness
   6) hosted teardown        — Delete hosted cluster and Azure resources
+
+OSC (OpenShift Sandboxed Containers):
+  7) osc install            — Install OSC operator and configure DaemonSet mode
+  8) osc validate           — Verify kata runtime and test kata pod
+  9) osc reboot             — Cordon, drain, and reboot worker nodes
 ```
 
 After user selects operation, prompt for required parameters:
@@ -896,6 +907,404 @@ echo "  rm -rf ~/Work/azure-hcp/oidc"
 echo "  rm ~/Work/azure-hcp/${CLUSTER_NAME}-kubeconfig"
 echo "  rm ~/Work/azure-hcp/workload-identities.json"
 echo "  rm ~/Work/azure-hcp/azure-creds.json"
+```
+
+---
+
+## OSC OPERATIONS
+
+### Preflight Check (all OSC subcommands)
+
+```bash
+# Hosted cluster kubeconfig
+HOSTED_KUBECONFIG="$HOME/Work/azure-hcp/${CLUSTER_NAME}-kubeconfig"
+[[ -f "$HOSTED_KUBECONFIG" ]] || { echo "BLOCK: Kubeconfig not found. Run: /hypershift-cluster-setup hosted validate --cluster-name ${CLUSTER_NAME}"; exit 1; }
+
+export KUBECONFIG=${HOSTED_KUBECONFIG}
+oc cluster-info >/dev/null 2>&1 || { echo "BLOCK: Cannot access hosted cluster (KUBECONFIG=$KUBECONFIG)"; exit 1; }
+echo "✓ Hosted cluster accessible"
+
+# Verify MCO is not functional (required for DaemonSet mode)
+if kubectl get machineconfigpools 2>&1 | grep -q "doesn't have a resource type"; then
+    echo "✓ MCO not functional (DaemonSet mode compatible)"
+else
+    echo "ERROR: MCO is functional on this cluster - DaemonSet mode will not work"
+    echo "This cluster requires MachineConfig mode, not DaemonSet mode"
+    exit 1
+fi
+
+# Check worker nodes
+NODE_COUNT=$(oc get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
+[[ "$NODE_COUNT" -gt 0 ]] || { echo "BLOCK: No worker nodes found"; exit 1; }
+echo "✓ Found ${NODE_COUNT} worker nodes"
+```
+
+---
+
+### 7. OSC Install - Install OSC Operator and Configure DaemonSet Mode
+
+```bash
+echo "=== Installing OpenShift Sandboxed Containers (OSC) ==="
+echo "Cluster: ${CLUSTER_NAME}"
+echo "Mode: DaemonSet (MCO non-functional)"
+echo ""
+
+# Step 1: Create namespace
+echo "=== Step 1: Creating Namespace ==="
+oc create namespace openshift-sandboxed-containers-operator 2>/dev/null || echo "✓ Namespace already exists"
+
+# Step 2: Create OperatorGroup
+echo ""
+echo "=== Step 2: Creating OperatorGroup ==="
+cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-sandboxed-containers-operator
+  namespace: openshift-sandboxed-containers-operator
+spec:
+  targetNamespaces:
+  - openshift-sandboxed-containers-operator
+EOF
+
+echo "✓ OperatorGroup created"
+
+# Step 3: Create Subscription
+echo ""
+echo "=== Step 3: Installing OSC Operator ==="
+cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-sandboxed-containers-operator
+  namespace: openshift-sandboxed-containers-operator
+spec:
+  channel: stable
+  name: sandboxed-containers-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+
+echo "Waiting for OSC operator to install (may take 2-3 minutes)..."
+sleep 30
+
+# Wait for CSV
+for i in {1..30}; do
+    CSV=\$(oc get csv -n openshift-sandboxed-containers-operator -o name 2>/dev/null | grep sandboxed-containers | head -1)
+    if [[ -n "\$CSV" ]]; then
+        PHASE=\$(oc get \${CSV} -n openshift-sandboxed-containers-operator -o jsonpath='{.status.phase}')
+        if [[ "\$PHASE" == "Succeeded" ]]; then
+            echo "✓ OSC operator installed: \${CSV}"
+            break
+        fi
+        echo "  Waiting for CSV (phase: \${PHASE})... (\$i/30)"
+    else
+        echo "  Waiting for CSV to appear... (\$i/30)"
+    fi
+    sleep 10
+done
+
+# Step 4: Create feature gates ConfigMap for DaemonSet mode
+echo ""
+echo "=== Step 4: Configuring DaemonSet Mode ==="
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: osc-feature-gates
+  namespace: openshift-sandboxed-containers-operator
+data:
+  deploymentMode: "DaemonSet"
+EOF
+
+echo "✓ Feature gates configured (deploymentMode: DaemonSet)"
+
+# Step 5: Label worker nodes for kata
+echo ""
+echo "=== Step 5: Labeling Worker Nodes ==="
+oc label node -l node-role.kubernetes.io/worker kata=true --overwrite
+echo "✓ Worker nodes labeled with kata=true"
+
+# Step 6: Create KataConfig
+echo ""
+echo "=== Step 6: Creating KataConfig ==="
+cat <<EOF | oc apply -f -
+apiVersion: kataconfiguration.openshift.io/v1
+kind: KataConfig
+metadata:
+  name: kata-config
+spec:
+  kataConfigPoolSelector:
+    matchLabels:
+      kata: "true"
+EOF
+
+echo "✓ KataConfig created"
+echo ""
+echo "Waiting for kata installation to begin (checking DaemonSet)..."
+
+# Wait for kata-install DaemonSet
+for i in {1..30}; do
+    if oc get daemonset -n openshift-sandboxed-containers-operator kata-install >/dev/null 2>&1; then
+        DESIRED=\$(oc get daemonset -n openshift-sandboxed-containers-operator kata-install -o jsonpath='{.status.desiredNumberScheduled}')
+        READY=\$(oc get daemonset -n openshift-sandboxed-containers-operator kata-install -o jsonpath='{.status.numberReady}')
+        echo "  kata-install DaemonSet: \${READY}/\${DESIRED} ready (\$i/30)"
+        if [[ "\$READY" == "\$DESIRED" && "\$READY" -gt 0 ]]; then
+            echo "✓ Kata installation DaemonSet ready"
+            break
+        fi
+    else
+        echo "  Waiting for kata-install DaemonSet... (\$i/30)"
+    fi
+    sleep 10
+done
+
+echo ""
+echo "✓ OSC installation complete!"
+echo ""
+echo "Summary:"
+echo "  - OSC operator installed in openshift-sandboxed-containers-operator namespace"
+echo "  - DaemonSet mode configured (MCO non-functional)"
+echo "  - KataConfig created with kata-install DaemonSet"
+echo "  - Worker nodes labeled with kata=true"
+echo ""
+echo "IMPORTANT: Worker nodes require reboot to load kata runtime"
+echo "Next steps:"
+echo "  1. Reboot nodes: /hypershift-cluster-setup osc reboot --cluster-name ${CLUSTER_NAME}"
+echo "  2. Validate installation: /hypershift-cluster-setup osc validate --cluster-name ${CLUSTER_NAME}"
+```
+
+---
+
+### 8. OSC Validate - Verify Kata Runtime and Test Kata Pod
+
+```bash
+echo "=== Validating OSC Installation ==="
+echo "Cluster: ${CLUSTER_NAME}"
+echo ""
+
+# Step 1: Check KataConfig status
+echo "=== Step 1: Checking KataConfig Status ==="
+KATACONFIG_STATUS=\$(oc get kataconfig kata-config -o jsonpath='{.status.installationStatus.IsInProgress}' 2>/dev/null || echo "unknown")
+KATACONFIG_COMPLETED=\$(oc get kataconfig kata-config -o jsonpath='{.status.installationStatus.Completed.CompletedNodesList}' 2>/dev/null | jq -r '.[]' 2>/dev/null | wc -l | tr -d ' ')
+
+echo "KataConfig installation in progress: \${KATACONFIG_STATUS}"
+echo "Nodes with kata installed: \${KATACONFIG_COMPLETED}"
+
+if oc get kataconfig kata-config -o yaml | grep -A 5 "^status:" | grep -q "Degraded"; then
+    echo "⚠️  KataConfig shows Degraded condition"
+    oc get kataconfig kata-config -o yaml | grep -A 10 "conditions:"
+fi
+
+# Step 2: Check kata-install DaemonSet
+echo ""
+echo "=== Step 2: Checking kata-install DaemonSet ==="
+if oc get daemonset -n openshift-sandboxed-containers-operator kata-install >/dev/null 2>&1; then
+    oc get daemonset -n openshift-sandboxed-containers-operator kata-install
+    echo ""
+    
+    DESIRED=\$(oc get daemonset -n openshift-sandboxed-containers-operator kata-install -o jsonpath='{.status.desiredNumberScheduled}')
+    READY=\$(oc get daemonset -n openshift-sandboxed-containers-operator kata-install -o jsonpath='{.status.numberReady}')
+    
+    if [[ "\$READY" == "\$DESIRED" && "\$READY" -gt 0 ]]; then
+        echo "✓ kata-install DaemonSet ready (\${READY}/\${DESIRED})"
+    else
+        echo "⚠️  kata-install DaemonSet not ready: \${READY}/\${DESIRED}"
+        echo "Check pod status:"
+        oc get pods -n openshift-sandboxed-containers-operator -l name=kata-install
+    fi
+else
+    echo "⚠️  kata-install DaemonSet not found"
+fi
+
+# Step 3: Check RuntimeClass
+echo ""
+echo "=== Step 3: Checking RuntimeClass ==="
+if oc get runtimeclass kata >/dev/null 2>&1; then
+    echo "✓ RuntimeClass 'kata' exists"
+    oc get runtimeclass kata -o yaml | grep -E "^  handler:|^  scheduling:"
+else
+    echo "⚠️  RuntimeClass 'kata' not found"
+    echo "Expected after kata installation completes"
+fi
+
+# Step 4: Check kata runtime on nodes
+echo ""
+echo "=== Step 4: Checking Kata Runtime on Nodes ==="
+for node in \$(oc get nodes -l kata=true -o name); do
+    node_name=\$(basename \$node)
+    echo "Node: \$node_name"
+    
+    # Check if node has kata runtime via node status
+    if oc get node \$node_name -o json | jq -r '.status.nodeInfo' | grep -q kata; then
+        echo "  ✓ Kata runtime detected in node info"
+    else
+        echo "  ℹ️  Kata runtime not visible in node info (may require reboot)"
+    fi
+done
+
+# Step 5: Deploy test kata pod
+echo ""
+echo "=== Step 5: Testing Kata Pod Deployment ==="
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-test-pod
+  namespace: default
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: test
+    image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+    command: ["sleep", "3600"]
+EOF
+
+echo "Waiting for kata test pod to start..."
+sleep 5
+
+POD_STATUS=\$(oc get pod kata-test-pod -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+echo "Test pod status: \${POD_STATUS}"
+
+if [[ "\$POD_STATUS" == "Running" ]]; then
+    echo "✓ Kata pod running successfully"
+    
+    # Verify it's actually using kata
+    NODE=\$(oc get pod kata-test-pod -n default -o jsonpath='{.spec.nodeName}')
+    echo "  Running on node: \${NODE}"
+    echo "  Runtime class: kata"
+    
+    # Check container runtime
+    RUNTIME_INFO=\$(oc get pod kata-test-pod -n default -o jsonpath='{.status.containerStatuses[0].containerID}')
+    echo "  Container ID: \${RUNTIME_INFO}"
+    
+elif [[ "\$POD_STATUS" == "Pending" ]]; then
+    echo "⚠️  Kata pod is Pending"
+    echo "Events:"
+    oc describe pod kata-test-pod -n default | grep -A 10 "^Events:"
+    
+elif [[ "\$POD_STATUS" == "Failed" || "\$POD_STATUS" == "Error" ]]; then
+    echo "❌ Kata pod failed to start"
+    oc describe pod kata-test-pod -n default
+else
+    echo "ℹ️  Kata pod status: \${POD_STATUS}"
+fi
+
+echo ""
+echo "To clean up test pod:"
+echo "  oc delete pod kata-test-pod -n default"
+
+echo ""
+echo "=== Validation Summary ==="
+if [[ "\$POD_STATUS" == "Running" ]]; then
+    echo "✓ OSC installation successful - kata pods can run"
+else
+    echo "⚠️  OSC installation incomplete or nodes need reboot"
+    echo "If nodes haven't been rebooted, run:"
+    echo "  /hypershift-cluster-setup osc reboot --cluster-name ${CLUSTER_NAME}"
+fi
+```
+
+---
+
+### 9. OSC Reboot - Cordon, Drain, and Reboot Worker Nodes
+
+```bash
+echo "=== Rebooting Worker Nodes ==="
+echo "Cluster: ${CLUSTER_NAME}"
+echo ""
+echo "This will sequentially:"
+echo "  1. Cordon each node (mark unschedulable)"
+echo "  2. Drain workloads to other nodes"
+echo "  3. Reboot the node via debug pod"
+echo "  4. Wait for node to come back Ready"
+echo "  5. Uncordon the node"
+echo ""
+
+read -p "Proceed with node reboots? [y/N] " -n 1 -r
+echo
+if [[ ! \$REPLY =~ ^[Yy]$ ]]; then
+    echo "Reboot cancelled"
+    exit 0
+fi
+
+NODES=\$(oc get nodes -l kata=true -o name)
+NODE_COUNT=\$(echo "\$NODES" | wc -l | tr -d ' ')
+
+echo "Found \${NODE_COUNT} nodes to reboot"
+echo ""
+
+for node in \$NODES; do
+    node_name=\$(basename \$node)
+    echo "=== Processing node: \${node_name} ==="
+    
+    # Cordon node
+    echo "  Cordoning node..."
+    oc adm cordon \${node_name}
+    
+    # Drain node
+    echo "  Draining node (may take a few minutes)..."
+    oc adm drain \${node_name} \\
+        --ignore-daemonsets \\
+        --delete-emptydir-data \\
+        --force \\
+        --grace-period=300 \\
+        --timeout=600s || {
+        echo "  ⚠️  Drain timed out or failed, continuing anyway..."
+    }
+    
+    # Reboot via debug pod
+    echo "  Rebooting node..."
+    oc debug node/\${node_name} -- chroot /host systemctl reboot &
+    
+    # Wait a moment for reboot to initiate
+    sleep 10
+    
+    # Wait for node to become NotReady
+    echo "  Waiting for node to go down..."
+    for i in {1..60}; do
+        STATUS=\$(oc get node \${node_name} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+        if [[ "\$STATUS" != "True" ]]; then
+            echo "  Node is down (iteration \$i)"
+            break
+        fi
+        sleep 5
+    done
+    
+    # Wait for node to come back Ready
+    echo "  Waiting for node to come back up (this can take 3-5 minutes)..."
+    for i in {1..120}; do
+        STATUS=\$(oc get node \${node_name} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+        if [[ "\$STATUS" == "True" ]]; then
+            echo "  ✓ Node is Ready (iteration \$i)"
+            break
+        fi
+        if [[ \$((i % 12)) -eq 0 ]]; then
+            echo "  Still waiting for node... (\$i/120)"
+        fi
+        sleep 5
+    done
+    
+    # Uncordon node
+    echo "  Uncordoning node..."
+    oc adm uncordon \${node_name}
+    
+    echo "  ✓ Node \${node_name} rebooted and ready"
+    echo ""
+    
+    # Small delay before next node
+    if [[ "\$node" != "\$(echo \"\$NODES\" | tail -1)" ]]; then
+        echo "Waiting 30s before processing next node..."
+        sleep 30
+    fi
+done
+
+echo ""
+echo "✓ All nodes rebooted successfully"
+echo ""
+echo "Next steps:"
+echo "  Validate kata installation: /hypershift-cluster-setup osc validate --cluster-name ${CLUSTER_NAME}"
 ```
 
 ---

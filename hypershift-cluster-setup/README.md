@@ -1,12 +1,13 @@
 # hypershift-cluster-setup command
 
-Complete Azure HyperShift setup from management cluster creation to hosted cluster validation. Automates IPI OpenShift installation, MCE/HyperShift deployment, Azure workload identity configuration, and hosted cluster provisioning. Designed for testing OpenShift Sandboxed Containers (OSC) DaemonSet mode on Azure HCP.
+Complete Azure HyperShift setup from management cluster creation to OSC installation. Automates IPI OpenShift installation, MCE/HyperShift deployment, Azure workload identity configuration, hosted cluster provisioning, and OpenShift Sandboxed Containers (OSC) DaemonSet installation and validation on Azure HCP.
 
 ## Invocation
 
 ```
 /hypershift-cluster-setup management <create|setup|teardown> [--name <NAME>]
 /hypershift-cluster-setup hosted <setup|validate|teardown> [--cluster-name <NAME>] [--location <REGION>] [--node-count <N>]
+/hypershift-cluster-setup osc <install|validate|reboot> [--cluster-name <NAME>]
 ```
 
 Run with no arguments for an interactive prompt.
@@ -27,12 +28,20 @@ Run with no arguments for an interactive prompt.
 | `hosted validate` | Verifies worker nodes joined, checks MCO is non-functional (required for DaemonSet mode), tests cluster readiness |
 | `hosted teardown` | Deletes hosted cluster resources, Azure VMs, managed identities, and OIDC infrastructure |
 
+## OSC Operations
+
+| Command | What it does |
+|---|---|
+| `osc install` | Installs OSC operator, configures DaemonSet mode, creates KataConfig, labels worker nodes for kata |
+| `osc validate` | Verifies kata runtime installed on nodes, deploys test kata pod to validate functionality |
+| `osc reboot` | Sequentially cordons, drains, and reboots worker nodes (required after kata installation to load runtime) |
+
 ## Flags
 
 | Flag | Applies to | Effect |
 |---|---|---|
 | `--name <name>` | `management create`, `management teardown` | Management cluster name (default: `$USER-hcp-host-$VERSION` extracted from release image) |
-| `--cluster-name <name>` | `hosted setup`, `hosted teardown`, `hosted validate` | Hosted cluster name (default: `$USER-hcp-YYYYMMDD`) |
+| `--cluster-name <name>` | `hosted *`, `osc *` | Hosted cluster name (default: `$USER-hcp-YYYYMMDD`) |
 | `--location <region>` | `management create`, `hosted setup` | Azure region (default: `eastus`) |
 | `--node-count <n>` | `hosted setup` | Number of worker nodes for hosted cluster (default: `2`) |
 | `--release-image <image>` | `hosted setup` | OCP release image (default: `quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64`) |
@@ -120,7 +129,7 @@ This usually indicates worker nodes haven't joined. Check:
 - cloud-token-minter logs show successful token creation
 - No authentication errors in capi-provider logs
 
-## Complete Workflow Example
+## Complete Workflow Examples
 
 ### From Zero to Hosted Cluster
 
@@ -143,6 +152,44 @@ This usually indicates worker nodes haven't joined. Check:
 # 5. Use the hosted cluster
 export KUBECONFIG=~/Work/azure-hcp/my-hcp-kubeconfig
 oc get nodes
+```
+
+### Complete End-to-End with OSC
+
+```bash
+# 1-4. Same as above (create management + hosted cluster)
+/hypershift-cluster-setup management create --name my-mgmt
+/hypershift-cluster-setup management setup
+/hypershift-cluster-setup hosted setup --cluster-name my-hcp
+/hypershift-cluster-setup hosted validate --cluster-name my-hcp
+
+# 5. Install OSC operator and configure DaemonSet mode
+/hypershift-cluster-setup osc install --cluster-name my-hcp
+# Takes ~3-5 minutes
+
+# 6. Reboot worker nodes (required to load kata runtime)
+/hypershift-cluster-setup osc reboot --cluster-name my-hcp
+# Takes ~5-10 minutes per node (sequential)
+
+# 7. Validate kata runtime installation
+/hypershift-cluster-setup osc validate --cluster-name my-hcp
+
+# 8. Deploy kata workload
+export KUBECONFIG=~/Work/azure-hcp/my-hcp-kubeconfig
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-kata-pod
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: nginx
+    image: nginx:latest
+EOF
+
+# Check kata pod is running
+oc get pod my-kata-pod -o wide
 ```
 
 ### Cleanup
