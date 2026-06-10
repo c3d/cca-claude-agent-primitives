@@ -1,7 +1,7 @@
 ---
 name: hypershift-cluster-setup
 description: Complete Azure HyperShift setup — creates management cluster (IPI OpenShift), installs MCE/HyperShift, creates hosted clusters with OIDC/managed identities, installs and validates OSC DaemonSet. Supports full teardown. Azure credentials must be configured via az login.
-argument-hint: "management create|setup|teardown [--name <NAME>] | hosted setup|validate|teardown [--cluster-name <NAME>] [--location <REGION>] [--node-count <N>] | osc install|validate|reboot [--cluster-name <NAME>]"
+argument-hint: "management create|setup|teardown [--name <NAME>] | hosted setup|validate|teardown [--cluster-name <NAME>] [--location <REGION>] [--node-count <N>] | osc install|validate|reboot [--cluster-name <NAME>] [--operator-image <IMAGE>]"
 allowed-tools:
   - Read
   - Write
@@ -80,6 +80,7 @@ Parse `$ARGUMENTS`:
 - `--location <region>` — Azure region (default: `eastus`)
 - `--node-count <n>` — worker nodes for hosted cluster (default: `2`)
 - `--release-image <image>` — OCP release (default: `quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64`)
+- `--operator-image <image>` — Custom OSC operator image for `osc install` (default: use OperatorHub)
 
 If no arguments given, show menu and ask for operation. THEN after selection, ask for parameters specific to that operation before executing.
 
@@ -150,6 +151,9 @@ CLUSTER_NAME="${CLUSTER_NAME:-${USER}-hcp-$(date +%Y%m%d)}"
 LOCATION="${LOCATION:-eastus}"
 NODE_COUNT="${NODE_COUNT:-2}"
 RELEASE_IMAGE="${RELEASE_IMAGE:-quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64}"
+
+# OSC operator
+OPERATOR_IMAGE="${OPERATOR_IMAGE:-}"  # Empty = use OperatorHub, set to custom image to override
 
 # Common
 BASE_DOMAIN="azure.sandboxedcontainers.com"
@@ -969,10 +973,99 @@ EOF
 
 echo "✓ OperatorGroup created"
 
-# Step 3: Create Subscription
+# Step 3: Install OSC Operator
 echo ""
 echo "=== Step 3: Installing OSC Operator ==="
-cat <<EOF | oc apply -f -
+
+# Check if custom operator image specified
+if [[ -n "${OPERATOR_IMAGE}" ]]; then
+    echo "Using custom OSC operator image: ${OPERATOR_IMAGE}"
+    echo ""
+    
+    # Deploy custom operator directly via Deployment (bypass OperatorHub)
+    cat <<EOF | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshift-sandboxed-containers-operator
+  namespace: openshift-sandboxed-containers-operator
+  labels:
+    app: openshift-sandboxed-containers-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openshift-sandboxed-containers-operator
+  template:
+    metadata:
+      labels:
+        app: openshift-sandboxed-containers-operator
+    spec:
+      serviceAccountName: openshift-sandboxed-containers-operator
+      containers:
+      - name: manager
+        image: ${OPERATOR_IMAGE}
+        command:
+        - /manager
+        env:
+        - name: RELATED_IMAGE_SANDBOXED_CONTAINERS_OPERATOR_BUNDLE
+          value: ${OPERATOR_IMAGE}
+        - name: OPERATOR_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: PLATFORM
+          value: "Azure"
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openshift-sandboxed-containers-operator
+  namespace: openshift-sandboxed-containers-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: openshift-sandboxed-containers-operator
+rules:
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openshift-sandboxed-containers-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: openshift-sandboxed-containers-operator
+subjects:
+- kind: ServiceAccount
+  name: openshift-sandboxed-containers-operator
+  namespace: openshift-sandboxed-containers-operator
+EOF
+
+    echo "Waiting for custom operator deployment (may take 1-2 minutes)..."
+    oc wait --for=condition=Available deployment/openshift-sandboxed-containers-operator \
+      -n openshift-sandboxed-containers-operator --timeout=5m
+    
+    echo "✓ Custom OSC operator deployed: ${OPERATOR_IMAGE}"
+    
+else
+    echo "Using OSC operator from OperatorHub"
+    echo ""
+    
+    # Standard OperatorHub installation
+    cat <<EOF | oc apply -f -
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
@@ -986,24 +1079,25 @@ spec:
   installPlanApproval: Automatic
 EOF
 
-echo "Waiting for OSC operator to install (may take 2-3 minutes)..."
-sleep 30
+    echo "Waiting for OSC operator to install (may take 2-3 minutes)..."
+    sleep 30
 
-# Wait for CSV
-for i in {1..30}; do
-    CSV=\$(oc get csv -n openshift-sandboxed-containers-operator -o name 2>/dev/null | grep sandboxed-containers | head -1)
-    if [[ -n "\$CSV" ]]; then
-        PHASE=\$(oc get \${CSV} -n openshift-sandboxed-containers-operator -o jsonpath='{.status.phase}')
-        if [[ "\$PHASE" == "Succeeded" ]]; then
-            echo "✓ OSC operator installed: \${CSV}"
-            break
+    # Wait for CSV
+    for i in {1..30}; do
+        CSV=\$(oc get csv -n openshift-sandboxed-containers-operator -o name 2>/dev/null | grep sandboxed-containers | head -1)
+        if [[ -n "\$CSV" ]]; then
+            PHASE=\$(oc get \${CSV} -n openshift-sandboxed-containers-operator -o jsonpath='{.status.phase}')
+            if [[ "\$PHASE" == "Succeeded" ]]; then
+                echo "✓ OSC operator installed: \${CSV}"
+                break
+            fi
+            echo "  Waiting for CSV (phase: \${PHASE})... (\$i/30)"
+        else
+            echo "  Waiting for CSV to appear... (\$i/30)"
         fi
-        echo "  Waiting for CSV (phase: \${PHASE})... (\$i/30)"
-    else
-        echo "  Waiting for CSV to appear... (\$i/30)"
-    fi
-    sleep 10
-done
+        sleep 10
+    done
+fi
 
 # Step 4: Create feature gates ConfigMap for DaemonSet mode
 echo ""

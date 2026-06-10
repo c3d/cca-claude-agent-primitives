@@ -7,7 +7,7 @@ Complete Azure HyperShift setup from management cluster creation to OSC installa
 ```
 /hypershift-cluster-setup management <create|setup|teardown> [--name <NAME>]
 /hypershift-cluster-setup hosted <setup|validate|teardown> [--cluster-name <NAME>] [--location <REGION>] [--node-count <N>]
-/hypershift-cluster-setup osc <install|validate|reboot> [--cluster-name <NAME>]
+/hypershift-cluster-setup osc <install|validate|reboot> [--cluster-name <NAME>] [--operator-image <IMAGE>]
 ```
 
 Run with no arguments for an interactive prompt.
@@ -45,6 +45,7 @@ Run with no arguments for an interactive prompt.
 | `--location <region>` | `management create`, `hosted setup` | Azure region (default: `eastus`) |
 | `--node-count <n>` | `hosted setup` | Number of worker nodes for hosted cluster (default: `2`) |
 | `--release-image <image>` | `hosted setup` | OCP release image (default: `quay.io/openshift-release-dev/ocp-release:4.21.5-x86_64`) |
+| `--operator-image <image>` | `osc install` | Custom OSC operator image (default: use OperatorHub). Use for testing custom builds with MCO-less support. |
 
 ## Prerequisites
 
@@ -102,6 +103,18 @@ Azure HCP hosted clusters have MachineConfig CRDs registered in the API, but the
 - No MCO controller pods managing the cluster
 
 **Impact:** OSC DaemonSet mode is **required** (MachineConfig mode will not work). The validation step checks for functional MCO by testing MachineConfigPool availability, not just CRD presence.
+
+### OSC operator v1.12.0 MCO dependency
+The standard OSC operator v1.12.0 from OperatorHub has a hard dependency on MachineConfigPool CRDs being present. Even with DaemonSet mode configured, the controller fails to start on MCO-less clusters because controller-runtime watches for MCPs during initialization.
+
+**Workaround:** Use a custom operator build that skips MCP watches:
+```bash
+/hypershift-cluster-setup osc install \
+  --cluster-name my-hcp \
+  --operator-image quay.io/c3d/openshift-sandboxed-containers-operator:hcp-skip-mcp-watch
+```
+
+This custom build removes the MCP watch requirement, allowing the operator to run successfully on Azure HCP clusters.
 
 ### Federated credential audience must be "openshift"
 OpenShift service account tokens use `"openshift"` audience, not the Azure standard `"api://AzureADTokenExchange"`. The setup step creates federated credentials with the correct audience.
@@ -190,6 +203,19 @@ EOF
 
 # Check kata pod is running
 oc get pod my-kata-pod -o wide
+```
+
+### Using Custom OSC Operator (for MCO-less support)
+
+```bash
+# Install custom OSC operator with MCO CRD watch skipped
+/hypershift-cluster-setup osc install \
+  --cluster-name my-hcp \
+  --operator-image quay.io/c3d/openshift-sandboxed-containers-operator:hcp-skip-mcp-watch
+
+# Continue with reboot and validation as normal
+/hypershift-cluster-setup osc reboot --cluster-name my-hcp
+/hypershift-cluster-setup osc validate --cluster-name my-hcp
 ```
 
 ### Cleanup
