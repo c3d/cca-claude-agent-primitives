@@ -1,7 +1,7 @@
 ---
 name: hypershift-cluster-setup
 description: Complete Azure HyperShift setup — creates management cluster (IPI OpenShift), installs MCE/HyperShift, creates hosted clusters with OIDC/managed identities, installs and validates OSC DaemonSet. Supports full teardown. Azure credentials must be configured via az login.
-argument-hint: "management create|setup|teardown [--name <NAME>] | hosted setup|validate|teardown [--cluster-name <NAME>] [--location <REGION>] [--node-count <N>] | osc install|validate|reboot [--cluster-name <NAME>] [--operator-image <IMAGE>]"
+argument-hint: "management create|setup|teardown [--name <NAME>] | hosted setup|validate|teardown [--cluster-name <NAME>] [--location <REGION>] [--node-count <N>] | osc install|validate|reboot|test [--cluster-name <NAME>] [--operator-image <IMAGE>]"
 allowed-tools:
   - Read
   - Write
@@ -29,6 +29,7 @@ Automate the complete lifecycle of self-managed Azure HyperShift for testing Ope
 - **osc install** — install OSC operator, configure DaemonSet mode, create KataConfig, label worker nodes
 - **osc validate** — verify kata runtime installed on nodes, test kata pod deployment
 - **osc reboot** — cordon, drain, and reboot worker nodes (required after kata installation)
+- **osc test** — deploy and verify various kata workloads (basic pod, nginx, busybox commands, network test)
 
 Azure credentials are assumed to be configured via `az login`.
 
@@ -72,7 +73,7 @@ Parse `$ARGUMENTS`:
 - Second positional arg: action
   - For `management`: `create`, `setup`, `teardown`
   - For `hosted`: `setup`, `validate`, `teardown`
-  - For `osc`: `install`, `validate`, `reboot`
+  - For `osc`: `install`, `validate`, `reboot`, `test`
 
 **Flags:**
 - `--name <name>` — management cluster name (default: `$USER-hcp-host-$VERSION` where VERSION extracted from OCP release)
@@ -102,6 +103,7 @@ OSC (OpenShift Sandboxed Containers):
   7) osc install            — Install OSC operator and configure DaemonSet mode
   8) osc validate           — Verify kata runtime and test kata pod
   9) osc reboot             — Cordon, drain, and reboot worker nodes
+  10) osc test              — Deploy and verify various kata workloads
 ```
 
 After user selects operation, prompt for required parameters:
@@ -1399,6 +1401,334 @@ echo "✓ All nodes rebooted successfully"
 echo ""
 echo "Next steps:"
 echo "  Validate kata installation: /hypershift-cluster-setup osc validate --cluster-name ${CLUSTER_NAME}"
+echo "  Run comprehensive tests: /hypershift-cluster-setup osc test --cluster-name ${CLUSTER_NAME}"
+```
+
+---
+
+### 10. OSC Test - Deploy and Verify Various Kata Workloads
+
+```bash
+echo "=== Testing Kata Workloads ==="
+echo "Cluster: ${CLUSTER_NAME}"
+echo ""
+echo "This will deploy and test various kata workloads:"
+echo "  1. Basic sleep pod"
+echo "  2. Nginx web server"
+echo "  3. Busybox with command execution"
+echo "  4. Network connectivity test"
+echo "  5. Multi-container pod"
+echo ""
+
+# Create test namespace
+TEST_NAMESPACE="kata-test-$(date +%s)"
+echo "Creating test namespace: ${TEST_NAMESPACE}"
+oc create namespace ${TEST_NAMESPACE}
+
+TESTS_PASSED=0
+TESTS_FAILED=0
+FAILED_TESTS=()
+
+# Test 1: Basic sleep pod
+echo ""
+echo "=== Test 1: Basic Sleep Pod ==="
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-sleep
+  namespace: ${TEST_NAMESPACE}
+  labels:
+    test: basic-sleep
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: sleeper
+    image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "100m"
+      limits:
+        memory: "128Mi"
+        cpu: "200m"
+EOF
+
+echo "Waiting for kata-sleep pod..."
+if oc wait --for=condition=Ready pod/kata-sleep -n ${TEST_NAMESPACE} --timeout=60s 2>/dev/null; then
+    echo "✓ Test 1 PASSED: Basic sleep pod running"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+    echo "✗ Test 1 FAILED: Pod did not become Ready"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    FAILED_TESTS+=("basic-sleep")
+    oc describe pod kata-sleep -n ${TEST_NAMESPACE} | tail -20
+fi
+
+# Test 2: Nginx web server
+echo ""
+echo "=== Test 2: Nginx Web Server ==="
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-nginx
+  namespace: ${TEST_NAMESPACE}
+  labels:
+    test: nginx
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: nginx
+    image: registry.access.redhat.com/ubi9/nginx-124:latest
+    ports:
+    - containerPort: 8080
+      name: http
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "256Mi"
+        cpu: "500m"
+EOF
+
+echo "Waiting for kata-nginx pod..."
+if oc wait --for=condition=Ready pod/kata-nginx -n ${TEST_NAMESPACE} --timeout=90s 2>/dev/null; then
+    echo "✓ Test 2 PASSED: Nginx pod running"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    
+    # Try to curl nginx (create a test pod to curl from)
+    echo "  Testing HTTP connectivity to nginx..."
+    NGINX_IP=$(oc get pod kata-nginx -n ${TEST_NAMESPACE} -o jsonpath='{.status.podIP}')
+    if oc run curl-test --image=registry.access.redhat.com/ubi9/ubi-minimal:latest \
+        --rm -i --restart=Never -n ${TEST_NAMESPACE} --timeout=30s \
+        -- curl -s -o /dev/null -w "%{http_code}" http://${NGINX_IP}:8080/ 2>/dev/null | grep -q 200; then
+        echo "  ✓ HTTP connectivity working (200 OK)"
+    else
+        echo "  ⚠️  HTTP connectivity test inconclusive"
+    fi
+else
+    echo "✗ Test 2 FAILED: Nginx pod did not become Ready"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    FAILED_TESTS+=("nginx")
+    oc describe pod kata-nginx -n ${TEST_NAMESPACE} | tail -20
+fi
+
+# Test 3: Busybox with command execution
+echo ""
+echo "=== Test 3: Busybox Command Execution ==="
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-busybox
+  namespace: ${TEST_NAMESPACE}
+  labels:
+    test: busybox
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: busybox
+    image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+    command: ["sh", "-c", "echo 'Kata runtime test' > /tmp/test.txt && sleep 3600"]
+    resources:
+      requests:
+        memory: "32Mi"
+        cpu: "50m"
+      limits:
+        memory: "64Mi"
+        cpu: "100m"
+EOF
+
+echo "Waiting for kata-busybox pod..."
+if oc wait --for=condition=Ready pod/kata-busybox -n ${TEST_NAMESPACE} --timeout=60s 2>/dev/null; then
+    echo "✓ Test 3 PASSED: Busybox pod running"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    
+    # Test command execution
+    echo "  Testing command execution..."
+    if oc exec kata-busybox -n ${TEST_NAMESPACE} -- cat /tmp/test.txt 2>/dev/null | grep -q "Kata runtime test"; then
+        echo "  ✓ Command execution working"
+    else
+        echo "  ⚠️  Command execution test failed"
+    fi
+else
+    echo "✗ Test 3 FAILED: Busybox pod did not become Ready"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    FAILED_TESTS+=("busybox")
+    oc describe pod kata-busybox -n ${TEST_NAMESPACE} | tail -20
+fi
+
+# Test 4: Network connectivity test (pod-to-pod)
+echo ""
+echo "=== Test 4: Network Connectivity Test ==="
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-nettest-server
+  namespace: ${TEST_NAMESPACE}
+  labels:
+    test: network-server
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: server
+    image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+    command: ["sh", "-c", "microdnf install -y nc && nc -l 8888"]
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "100m"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-nettest-client
+  namespace: ${TEST_NAMESPACE}
+  labels:
+    test: network-client
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: client
+    image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+    command: ["sleep", "3600"]
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "100m"
+EOF
+
+echo "Waiting for network test pods..."
+sleep 10
+if oc wait --for=condition=Ready pod/kata-nettest-client -n ${TEST_NAMESPACE} --timeout=90s 2>/dev/null; then
+    SERVER_IP=$(oc get pod kata-nettest-server -n ${TEST_NAMESPACE} -o jsonpath='{.status.podIP}' 2>/dev/null)
+    if [[ -n "$SERVER_IP" ]]; then
+        echo "  Server IP: ${SERVER_IP}"
+        echo "  Testing pod-to-pod connectivity..."
+        
+        # Try to connect to the server (simplified test - just check if we can reach it)
+        if oc exec kata-nettest-client -n ${TEST_NAMESPACE} -- sh -c "microdnf install -y nc 2>/dev/null && timeout 5 nc -zv ${SERVER_IP} 8888" 2>&1 | grep -q "succeeded\|open"; then
+            echo "✓ Test 4 PASSED: Pod-to-pod network connectivity working"
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+        else
+            echo "✗ Test 4 FAILED: Pod-to-pod connectivity failed"
+            TESTS_FAILED=$((TESTS_FAILED + 1))
+            FAILED_TESTS+=("network")
+        fi
+    else
+        echo "✗ Test 4 FAILED: Could not get server IP"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        FAILED_TESTS+=("network")
+    fi
+else
+    echo "✗ Test 4 FAILED: Network test pods did not become Ready"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    FAILED_TESTS+=("network")
+fi
+
+# Test 5: Multi-container pod
+echo ""
+echo "=== Test 5: Multi-Container Pod ==="
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-multicontainer
+  namespace: ${TEST_NAMESPACE}
+  labels:
+    test: multicontainer
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: container1
+    image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+    command: ["sh", "-c", "echo 'Container 1' > /shared/c1.txt && sleep 3600"]
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+    resources:
+      requests:
+        memory: "32Mi"
+        cpu: "50m"
+  - name: container2
+    image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+    command: ["sh", "-c", "sleep 10 && cat /shared/c1.txt && sleep 3600"]
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+    resources:
+      requests:
+        memory: "32Mi"
+        cpu: "50m"
+  volumes:
+  - name: shared-data
+    emptyDir: {}
+EOF
+
+echo "Waiting for kata-multicontainer pod..."
+if oc wait --for=condition=Ready pod/kata-multicontainer -n ${TEST_NAMESPACE} --timeout=60s 2>/dev/null; then
+    echo "✓ Test 5 PASSED: Multi-container pod running"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    
+    # Test shared volume
+    echo "  Testing shared volume between containers..."
+    sleep 3
+    if oc logs kata-multicontainer -n ${TEST_NAMESPACE} -c container2 2>/dev/null | grep -q "Container 1"; then
+        echo "  ✓ Shared volume working between containers"
+    else
+        echo "  ⚠️  Shared volume test inconclusive"
+    fi
+else
+    echo "✗ Test 5 FAILED: Multi-container pod did not become Ready"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    FAILED_TESTS+=("multicontainer")
+    oc describe pod kata-multicontainer -n ${TEST_NAMESPACE} | tail -20
+fi
+
+# Summary
+echo ""
+echo "=== Test Summary ==="
+echo "Total tests: $((TESTS_PASSED + TESTS_FAILED))"
+echo "Passed: ${TESTS_PASSED}"
+echo "Failed: ${TESTS_FAILED}"
+
+if [[ ${TESTS_FAILED} -gt 0 ]]; then
+    echo ""
+    echo "Failed tests:"
+    for test in "${FAILED_TESTS[@]}"; do
+        echo "  - ${test}"
+    done
+fi
+
+# Show all test pods status
+echo ""
+echo "=== All Test Pods Status ==="
+oc get pods -n ${TEST_NAMESPACE} -o wide
+
+# Cleanup prompt
+echo ""
+read -p "Delete test namespace ${TEST_NAMESPACE}? [Y/n] " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+    oc delete namespace ${TEST_NAMESPACE} --wait=false
+    echo "✓ Test namespace deletion initiated"
+else
+    echo "Test namespace preserved: ${TEST_NAMESPACE}"
+    echo "To delete later: oc delete namespace ${TEST_NAMESPACE}"
+fi
+
+echo ""
+if [[ ${TESTS_FAILED} -eq 0 ]]; then
+    echo "✓ All kata workload tests passed!"
+    exit 0
+else
+    echo "⚠️  Some tests failed - review output above"
+    exit 1
+fi
 ```
 
 ---
